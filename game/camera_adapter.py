@@ -3,6 +3,7 @@
 """
 import cv2
 import numpy as np
+import os
 import subprocess
 import threading
 import queue
@@ -283,7 +284,11 @@ class CameraAutoDetect:
                 return adapter
         
         # 2. 尝试 Mooer Camera RTSP
-        mooer_url = "rtsp://admin:PASSWORD@192.168.1.55:554/h264/ch1/main/av_stream"
+        # 从环境变量读取摄像头配置，默认使用示例地址
+        mooer_user = os.getenv('MOOER_CAM_USER', 'admin')
+        mooer_pass = os.getenv('MOOER_CAM_PASS', 'password')
+        mooer_ip = os.getenv('MOOER_CAM_IP', '192.168.1.55')
+        mooer_url = f"rtsp://{mooer_user}:{mooer_pass}@{mooer_ip}:554/h264/ch1/main/av_stream"
         print("🔍 尝试连接 Mooer Camera...")
         if CameraAutoDetect.test_rtsp(mooer_url, timeout=3.0):
             config = CameraConfig(
@@ -335,8 +340,12 @@ def create_camera(source_type: str = "auto", **kwargs) -> Optional[CameraAdapter
         )
     
     elif source_type == "mooer":
-        url = kwargs.get('rtsp_url', 
-            "rtsp://admin:PASSWORD@192.168.1.55:554/h264/ch1/main/av_stream")
+        # 从环境变量读取摄像头配置
+        mooer_user = os.getenv('MOOER_CAM_USER', 'admin')
+        mooer_pass = os.getenv('MOOER_CAM_PASS', 'password')
+        mooer_ip = os.getenv('MOOER_CAM_IP', '192.168.1.55')
+        default_url = f"rtsp://{mooer_user}:{mooer_pass}@{mooer_ip}:554/h264/ch1/main/av_stream"
+        url = kwargs.get('rtsp_url', default_url)
         config = CameraConfig(
             source=CameraSource.MOOER,
             rtsp_url=url

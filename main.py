@@ -7,6 +7,8 @@ import cv2
 import pygame
 import numpy as np
 import mediapipe as mp
+from pathlib import Path
+from typing import Any
 from game.archer import Archer
 from game.target import Target
 from game.physics import ArrowPhysics
@@ -20,6 +22,11 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 FPS = 60
 
+# 双手拉弓参数
+PULL_START_THRESHOLD = 25
+RELEASE_DISTANCE_DELTA = 18
+POWER_DISTANCE_SCALE = 2.5
+
 # 颜色
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
@@ -29,13 +36,53 @@ GOLD = (255, 215, 0)
 RED = (220, 20, 60)
 BLUE = (30, 144, 255)
 
+# 中文字体配置 - 按优先级排列
+CHINESE_FONT_PATHS = [
+    "/usr/share/fonts/truetype/arphic/ukai.ttc",  # AR PL UKai
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Noto Sans CJK
+    "/usr/share/fonts/truetype/arphic/uming.ttc",  # AR PL UMing
+]
+CHINESE_FONT_SIZE = 36
+CHINESE_FONT_SMALL = 28
+
+def load_chinese_font():
+    """尝试加载中文字体，返回 (font, small_font, 成功标志)"""
+    import os
+    
+    print(f"\n🔤 加载中文字体...", flush=True)
+    
+    for font_path in CHINESE_FONT_PATHS:
+        print(f"   尝试: {font_path}", flush=True)
+        
+        # 检查文件是否存在
+        if not os.path.exists(font_path):
+            print(f"   ❌ 文件不存在", flush=True)
+            continue
+        
+        try:
+            font = pygame.font.Font(font_path, CHINESE_FONT_SIZE)
+            small_font = pygame.font.Font(font_path, CHINESE_FONT_SMALL)
+            
+            # 测试渲染
+            test_surface = font.render("中文测试", True, (255, 255, 255))
+            print(f"   ✅ 加载成功，测试渲染尺寸: {test_surface.get_size()}", flush=True)
+            
+            return font, small_font, True
+        except Exception as e:
+            print(f"   ⚠️ 加载失败: {e}", flush=True)
+            continue
+    
+    print("❌ 所有中文字体加载失败，使用默认字体", flush=True)
+    return pygame.font.Font(None, 48), pygame.font.Font(None, 36), False
+
 class ArcheryGame:
     def __init__(self, camera_source="auto", rtsp_url=None):
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         pygame.display.set_caption("体感射箭游戏 | Hand Tracking Archery")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font(None, 48)
-        self.small_font = pygame.font.Font(None, 36)
+        
+        # 加载中文字体
+        self.font, self.small_font, self.font_loaded = load_chinese_font()
         
         # 摄像头适配器（新版多源支持）
         self.camera = None
@@ -63,14 +110,12 @@ class ArcheryGame:
         else:
             print("⚠️ 使用鼠标控制模式")
         
-        # MediaPipe Hands (使用传统 API，更稳定)
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        # MediaPipe Hands（兼容 solutions / tasks 两种 API）
+        self.mp_hands: Any = None
+        self.hands = None
+        self.hand_tracking_mode = "none"
+        self._video_timestamp_ms = 0
+        self._init_hand_tracker()
         
         # 游戏对象
         self.archer = Archer()
@@ -88,74 +133,179 @@ class ArcheryGame:
         # 手部追踪数据
         self.prev_hand_pos = None
         self.pull_start_pos = None
+        self.neutral_hand_distance = None
+        self.prev_hand_distance = None
+
+    def _init_hand_tracker(self):
+        """初始化 MediaPipe 手势识别，优先使用传统 solutions API。"""
+        mp_solutions = getattr(mp, "solutions", None)
+        mp_hands_module = getattr(mp_solutions, "hands", None)
+
+        if mp_hands_module is not None:
+            self.mp_hands = mp_hands_module
+            self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self.hand_tracking_mode = "solutions"
+            print("✅ MediaPipe Hands 初始化成功: solutions API")
+            return
+
+        try:
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+
+            model_candidates = [
+                Path(__file__).resolve().parent / "hand_landmarker.task",
+                Path.cwd() / "hand_landmarker.task",
+            ]
+            model_path = next((p for p in model_candidates if p.exists()), None)
+            if model_path is None:
+                raise FileNotFoundError("未找到 hand_landmarker.task 模型文件")
+
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=2,
+                min_hand_detection_confidence=0.5,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self.hands = vision.HandLandmarker.create_from_options(options)
+            self.hand_tracking_mode = "tasks"
+            print(f"✅ MediaPipe Hands 初始化成功: tasks API ({model_path.name})")
+        except Exception as e:
+            print(f"⚠️ MediaPipe 手势识别不可用，回退到鼠标模式: {e}")
+            if self.camera:
+                self.camera.stop()
+                self.camera = None
+            self.camera_available = False
+            self.camera_info = "鼠标控制"
     
     def get_hand_data(self, frame):
         """从摄像头获取手部位置"""
-        if not self.camera_available or frame is None:
+        if not self.camera_available or frame is None or self.hands is None:
             return []
-        
-        # 使用传统 MediaPipe API
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(frame_rgb)
-        
+
         hands_data = []
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # 获取关键点位
-                wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
-                index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
-                middle_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-                
-                # 转换为屏幕坐标
+
+        if self.hand_tracking_mode == "solutions" and self.mp_hands is not None:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.hands.process(frame_rgb)
+            if results.multi_hand_landmarks:
+                handedness_list = results.multi_handedness or []
+                for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                    wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
+                    index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                    middle_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+
+                    handedness = "Unknown"
+                    if i < len(handedness_list):
+                        cls = handedness_list[i].classification
+                        if cls:
+                            handedness = cls[0].label
+
+                    def to_screen(lm):
+                        return (int(lm.x * SCREEN_WIDTH), int(lm.y * SCREEN_HEIGHT))
+
+                    hands_data.append({
+                        'wrist': to_screen(wrist),
+                        'index_tip': to_screen(index_tip),
+                        'middle_tip': to_screen(middle_tip),
+                        'handedness': handedness
+                    })
+
+        elif self.hand_tracking_mode == "tasks":
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            self._video_timestamp_ms += 16
+            results = self.hands.detect_for_video(mp_image, self._video_timestamp_ms)
+            for i, landmarks in enumerate(results.hand_landmarks):
+                wrist = landmarks[0]
+                index_tip = landmarks[8]
+                middle_tip = landmarks[12]
+
+                handedness = "Unknown"
+                if i < len(results.handedness) and results.handedness[i]:
+                    category = results.handedness[i][0]
+                    handedness = getattr(category, "category_name", None) or getattr(category, "display_name", None) or "Unknown"
+
                 def to_screen(lm):
                     return (int(lm.x * SCREEN_WIDTH), int(lm.y * SCREEN_HEIGHT))
-                
+
                 hands_data.append({
                     'wrist': to_screen(wrist),
                     'index_tip': to_screen(index_tip),
-                    'middle_tip': to_screen(middle_tip)
+                    'middle_tip': to_screen(middle_tip),
+                    'handedness': handedness
                 })
         
         return hands_data
+
+    def _select_bow_and_string_hands(self, hands_data):
+        """优先按左右手识别角色；失败时按 x 坐标兜底。"""
+        if len(hands_data) < 2:
+            return None, None
+
+        left_hand = next((h for h in hands_data if h.get('handedness') == "Left"), None)
+        right_hand = next((h for h in hands_data if h.get('handedness') == "Right"), None)
+
+        if left_hand and right_hand:
+            return left_hand, right_hand
+
+        ordered = sorted(hands_data, key=lambda h: h['index_tip'][0])
+        return ordered[0], ordered[-1]
     
     def calculate_bow_state(self, hands_data):
-        """根据手部位置计算弓的状态"""
-        if len(hands_data) < 1:
+        """双手状态机：一只手持弓，一只手拉弦。"""
+        if len(hands_data) < 2:
+            if self.game_state == "pulling":
+                self.game_state = "aiming"
+                self.bow_power = 0
+            self.prev_hand_distance = None
             return None, 0, 0
-        
-        hand = hands_data[0]
-        hand_pos = hand['index_tip']
-        
+
+        bow_hand, string_hand = self._select_bow_and_string_hands(hands_data)
+        if not bow_hand or not string_hand:
+            return None, self.bow_power, self.bow_angle
+
+        bow_pos = bow_hand['index_tip']
+        string_pos = string_hand['index_tip']
+
+        dx = string_pos[0] - bow_pos[0]
+        dy = string_pos[1] - bow_pos[1]
+        current_distance = float(np.hypot(dx, dy))
+
+        if self.neutral_hand_distance is None:
+            self.neutral_hand_distance = current_distance
+
+        # 保证箭总体向右飞行，同时使用双手相对高度控制角度
+        aim_dx = max(abs(dx), 1)
+        aim_dy = bow_pos[1] - string_pos[1]
+        self.bow_angle = float(np.degrees(np.arctan2(aim_dy, aim_dx)))
+
         if self.game_state == "aiming":
-            if self.prev_hand_pos:
-                dx = hand_pos[0] - self.prev_hand_pos[0]
-                dy = hand_pos[1] - self.prev_hand_pos[1]
-                
-                if dx < -20 and self.arrows_left > 0:
-                    self.game_state = "pulling"
-                    self.pull_start_pos = self.prev_hand_pos
-            
-            center_x = SCREEN_WIDTH // 2
-            center_y = SCREEN_HEIGHT // 2
-            dx = hand_pos[0] - center_x
-            dy = hand_pos[1] - center_y
-            self.bow_angle = np.degrees(np.arctan2(dy, dx))
-            
+            # 在瞄准阶段更新自然间距基线，用于抵抗不同站位与身材差异
+            self.neutral_hand_distance = self.neutral_hand_distance * 0.9 + current_distance * 0.1
+            pull_delta = current_distance - self.neutral_hand_distance
+
+            if pull_delta > PULL_START_THRESHOLD and self.arrows_left > 0:
+                self.game_state = "pulling"
+
         elif self.game_state == "pulling":
-            if self.pull_start_pos:
-                pull_distance = np.sqrt(
-                    (hand_pos[0] - self.pull_start_pos[0]) ** 2 +
-                    (hand_pos[1] - self.pull_start_pos[1]) ** 2
-                )
-                self.bow_power = min(pull_distance / 3, self.max_power)
-                
-                if self.prev_hand_pos:
-                    dx = hand_pos[0] - self.prev_hand_pos[0]
-                    if dx > 30:
-                        self.release_arrow()
-        
-        self.prev_hand_pos = hand_pos
-        return hand_pos, self.bow_power, self.bow_angle
+            pull_delta = max(0.0, current_distance - self.neutral_hand_distance)
+            self.bow_power = min(pull_delta * POWER_DISTANCE_SCALE, self.max_power)
+
+            if self.prev_hand_distance is not None:
+                release_delta = self.prev_hand_distance - current_distance
+                if release_delta > RELEASE_DISTANCE_DELTA:
+                    self.release_arrow()
+
+        self.prev_hand_distance = current_distance
+        self.prev_hand_pos = bow_pos
+        return bow_pos, self.bow_power, self.bow_angle
     
     def release_arrow(self):
         """放箭"""
@@ -273,9 +423,9 @@ class ArcheryGame:
         
         if self.camera_available:
             if self.game_state == "aiming":
-                hint = "举起手，向后拉弓"
+                hint = "双手入镜：一手持弓，一手向后拉"
             elif self.game_state == "pulling":
-                hint = "拉满后快速前推放箭！"
+                hint = "保持拉弓，拉弦手快速前送放箭！"
             elif self.game_state == "released":
                 hint = "箭已射出..."
             else:
@@ -370,19 +520,103 @@ class ArcheryGame:
             pygame.display.flip()
         
         # 清理
+        if self.hands and hasattr(self.hands, "close"):
+            self.hands.close()
         if self.camera:
             self.camera.stop()
         pygame.quit()
         sys.exit()
 
 if __name__ == "__main__":
-    print("启动体感射箭游戏...")
-    print("控制方式：")
-    print("  - 摄像头: 举手向后拉拉弓，前推放箭")
-    print("  - 鼠标: 左键按住拉弓，移动瞄准，松开放箭")
-    print("  - R: 重置游戏")
-    print("  - ESC: 退出")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='体感射箭游戏')
+    parser.add_argument('--camera', '-c', choices=['auto', 'usb', 'rtsp', 'mooer', 'mouse'],
+                       default='auto', help='摄像头源 (默认: auto)')
+    parser.add_argument('--rtsp-url', '-u', type=str,
+                       help='RTSP 流地址 (例如: rtsp://user:pass@ip:554/stream)')
+    parser.add_argument('--list', '-l', action='store_true',
+                       help='列出可用摄像头并退出')
+    
+    args = parser.parse_args()
+    
+    # 列出可用摄像头
+    if args.list:
+        print("🔍 检测可用摄像头...\n")
+        
+        # USB 摄像头
+        usb_cams = CameraAutoDetect.detect_usb_cameras()
+        print(f"USB 摄像头: {len(usb_cams)} 个")
+        for cam in usb_cams:
+            print(f"  /dev/video{cam['id']}: {cam['resolution']}")
+        
+        # RTSP 测试
+        print("\nRTSP 流测试:")
+        # 从环境变量读取摄像头配置
+        mooer_user = os.getenv('MOOER_CAM_USER', 'admin')
+        mooer_pass = os.getenv('MOOER_CAM_PASS', 'password')
+        mooer_ip = os.getenv('MOOER_CAM_IP', '192.168.1.55')
+        mooer_url = f"rtsp://{mooer_user}:{mooer_pass}@{mooer_ip}:554/h264/ch1/main/av_stream"
+        test_urls = [
+            ("Mooer Camera", mooer_url),
+        ]
+        if args.rtsp_url:
+            test_urls.append(("自定义", args.rtsp_url))
+        
+        for name, url in test_urls:
+            print(f"  {name}: ", end="", flush=True)
+            if CameraAutoDetect.test_rtsp(url, timeout=3.0):
+                print("✅ 可用")
+            else:
+                print("❌ 不可用")
+        
+        sys.exit(0)
+    
+    # 启动游戏
+    print("\n🏹 启动体感射箭游戏...")
+    print("=" * 40)
+    print("控制方式:")
+    print("  摄像头: 举手向后拉拉弓，前推放箭")
+    print("  鼠标:   左键按住拉弓，移动瞄准，松开放箭")
+    print("=" * 40)
     print()
     
-    game = ArcheryGame()
+    # 选择摄像头源
+    camera_source = args.camera
+    rtsp_url = args.rtsp_url
+    
+    if camera_source == "mouse":
+        # 纯鼠标模式，跳过摄像头检测
+        print("🖱️  纯鼠标控制模式")
+        game = ArcheryGame.__new__(ArcheryGame)
+        game.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("体感射箭游戏 | 鼠标模式")
+        game.clock = pygame.time.Clock()
+        
+        # 加载中文字体（关键修复）
+        game.font, game.small_font, game.font_loaded = load_chinese_font()
+        
+        game.camera = None
+        game.camera_available = False
+        game.camera_info = "鼠标控制"
+        game.mp_hands = None
+        game.hands = None
+        game.hand_tracking_mode = "none"
+        game._video_timestamp_ms = 0
+        game.archer = Archer()
+        game.target = Target()
+        game.physics = ArrowPhysics()
+        game.score = 0
+        game.arrows_left = 10
+        game.game_state = "aiming"
+        game.bow_power = 0
+        game.max_power = 100
+        game.bow_angle = 0
+        game.prev_hand_pos = None
+        game.pull_start_pos = None
+        game.neutral_hand_distance = None
+        game.prev_hand_distance = None
+    else:
+        game = ArcheryGame(camera_source=camera_source, rtsp_url=rtsp_url)
+    
     game.run()

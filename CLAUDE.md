@@ -1,102 +1,264 @@
-# Archery Game - 项目活文档
-
-> 本文档记录项目背景、规则、踩坑经验和重要决策。
-> 与代码一起演进，保持精简有效。
+# CLAUDE.md - 项目上下文
 
 ## 项目概述
 
-**项目名称**: Archery Game（体感射箭游戏）
-**技术栈**: Python + OpenCV + MediaPipe + Pygame
-**核心玩法**: 通过摄像头捕捉手势，模拟拉弓射箭动作
+**项目名称**: Archery Game（体感射箭游戏）  
+**类型**: Pygame + OpenCV + MediaPipe 体感游戏  
+**创建日期**: 2026-02-13  
+**作者**: Albert Wang (@albertofwb)  
+**位置**: `~/archery-game/`
 
-## 目录结构
+---
 
-```
-~/archery-game/
-├── main.py              # 游戏主入口
-├── game/                # 游戏核心逻辑
-│   ├── __init__.py
-│   ├── archer.py        # 弓箭手/弓箭逻辑
-│   ├── target.py        # 靶子系统
-│   ├── physics.py       # 物理引擎（箭的飞行）
-│   └── camera.py        # 摄像头与手势识别
-├── assets/              # 资源文件
-│   ├── images/
-│   └── sounds/
-├── requirements.txt     # 依赖
-├── README.md           # 项目说明
-└── CLAUDE.md           # 本文件
-```
+## 核心需求
 
-## 开发规范
+1. **体感控制**: 通过摄像头捕捉手势实现射箭动作
+2. **多源摄像头**: 支持 USB / RTSP / Mooer Camera
+3. **游戏性**: 物理引擎、计分系统、流畅体验
+4. **跨平台**: 优先 Linux，兼容 Windows/macOS
 
-### 环境设置
-```bash
-cd ~/archery-game
-# 使用项目自带的 .venv 或创建新的
-source .venv/bin/activate  # 如果存在
-```
+---
 
-### Git 工作流
-1. 原子化提交：先说明计划，验证后再 commit/push
-2. 不跟踪的文件：.venv/, *.task, __pycache__/, IDE配置等（见 .gitignore）
-3. 提交前检查：`git status` 确认只提交了相关文件
+## 技术栈
 
-### 代码规范
-- 使用有意义的变量名
-- 核心游戏逻辑添加注释
-- 手势识别参数可调（拉弓阈值、灵敏度等）
-
-## 核心机制
-
-### 手势识别流程
-1. **检测手**: MediaPipe Hands 检测手部关键点
-2. **拉弓动作**: 检测手往后拉的移动距离
-3. **瞄准**: 通过手的位置调整射箭角度
-4. **放箭**: 手快速前推或特定手势触发
-
-### 物理系统
-- 箭的抛物线轨迹
-- 重力影响
-- 风速（可选扩展）
-
-### 计分规则
-- 靶心得分最高
-- 根据命中环数计算得分
-- 连击/ combo 系统（可选）
-
-## 已知问题 & 待办
-
-### 当前状态
-- [ ] 需要验证手势识别的准确度
-- [ ] 调整拉弓灵敏度参数
-- [ ] 添加游戏音效
-
-### 未来扩展
-- [ ] 多人对战模式
-- [ ] 不同难度级别
-- [ ] 保存最高分记录
-
-## 重要决策记录
-
-| 日期 | 决策 | 原因 |
+| 组件 | 用途 | 版本 |
 |------|------|------|
-| 2026-02-13 | 使用 MediaPipe 进行手势识别 | 准确度高，易于集成 |
+| **Python** | 主语言 | 3.13 |
+| **Pygame** | 游戏引擎、渲染 | 2.6.1 |
+| **OpenCV** | 摄像头接入、图像处理 | 4.13 |
+| **MediaPipe** | 手势识别（21 关键点） | 0.10.x |
+| **NumPy** | 数值计算 | 2.4 |
 
-## 调试技巧
+---
 
-### 手势识别调试
-- 在画面上显示手部关键点（调试用）
-- 输出拉弓距离数值到控制台
-- 使用 `debug=True` 模式运行
+## 文件职责
 
-### 性能优化
-- MediaPipe 模型文件较大（~7MB），不纳入 Git
-- 降低摄像头分辨率可提高帧率
-- 只在需要时运行手势检测
+### 核心文件
 
-## 参考资源
+| 文件 | 职责 | 关键函数 |
+|------|------|----------|
+| `main.py` | 游戏主循环、事件处理 | `ArcheryGame.run()` |
+| `game/archer.py` | 弓箭状态管理 | `Archer.update()` |
+| `game/target.py` | 靶子绘制、碰撞检测 | `Target.check_hit()` |
+| `game/physics.py` | 箭的物理运动 | `ArrowPhysics.update()` |
+| `game/camera_adapter.py` | 多源摄像头适配 ⭐ | `create_camera()` |
+| `game/mooer_api.py` | 云台控制 API | `MooerCameraAPI.move()` |
 
-- [MediaPipe Hands](https://developers.google.com/mediapipe/solutions/vision/gesture_recognizer)
-- [Pygame 文档](https://www.pygame.org/docs/)
-- [OpenCV Python](https://docs.opencv.org/4.x/d6/d00/tutorial_py_root.html)
+### 配置文件
+
+| 文件 | 用途 |
+|------|------|
+| `requirements.txt` | Python 依赖 |
+| `hand_landmarker.task` | MediaPipe 模型 (~8MB) |
+| `memory/camera-config.yaml` | Mooer Camera 凭据 |
+
+---
+
+## 手势识别流程
+
+```
+摄像头帧 (BGR)
+    ↓
+cv2.cvtColor() → RGB
+    ↓
+MediaPipe Hands.process()
+    ↓
+提取 INDEX_FINGER_TIP (8) 坐标
+    ↓
+映射到屏幕坐标 (1280x720)
+    ↓
+位移计算 → 拉弓/放箭检测
+```
+
+### 关键阈值
+
+```python
+# 拉弓触发：手向左移动 > 20px
+PULL_THRESHOLD = 20
+
+# 放箭触发：手向右快速移动 > 30px
+RELEASE_THRESHOLD = 30
+
+# 最小放箭力度
+MIN_POWER = 10
+```
+
+---
+
+## 摄像头适配器
+
+### 架构
+
+```
+CameraAdapter
+├── CameraConfig (source, url, resolution)
+├── 采集线程 (background capture)
+└── 帧队列 (Queue, maxsize=2)
+```
+
+### 支持的源
+
+| 源类型 | 标识 | 实现 |
+|--------|------|------|
+| USB | `CameraSource.USB` | OpenCV VideoCapture |
+| RTSP | `CameraSource.RTSP` | FFmpeg/GStreamer |
+| Mooer | `CameraSource.MOOER` | RTSP + 云台 API |
+
+### 自动检测优先级
+
+1. USB 摄像头 (`/dev/video0-9`)
+2. Mooer Camera RTSP
+3. 回退到鼠标模式
+
+---
+
+## 物理引擎参数
+
+```python
+GRAVITY = 300          # px/s²
+MAX_POWER = 100        # 最大拉弓力度
+VELOCITY_SCALE = 0.3   # 力度→速度转换系数
+ARROW_LENGTH = 40      # 箭长 (px)
+TRAIL_LENGTH = 20      # 轨迹点数量
+```
+
+### 运动方程
+
+```python
+# 初始化
+vx = power * VELOCITY_SCALE * cos(angle)
+vy = power * VELOCITY_SCALE * sin(angle)
+
+# 每帧更新
+dt = 1/60  # 假设 60 FPS
+vy += GRAVITY * dt
+x += vx * dt
+y += vy * dt
+```
+
+---
+
+## 计分规则
+
+```
+黄心 (r=20):  10 分
+红圈 (r=30):   6 分
+蓝圈 (r=40):   4 分
+黑圈 (r=50):   2 分
+白圈 (r=60):   1 分
+未命中:        0 分
+```
+
+---
+
+## Mooer Camera 集成
+
+### 萤石云 API
+
+```python
+base_url = "https://open.ezvizapi.com"
+endpoints = {
+    "ptz_start": "/api/lapp/device/ptz/start",
+    "ptz_stop": "/api/lapp/device/ptz/stop",
+    "device_info": "/api/lapp/device/info"
+}
+```
+
+### 云台控制
+
+| 方向 | API 参数 |
+|------|----------|
+| 上 | `direction=0` |
+| 下 | `direction=1` |
+| 左 | `direction=2` |
+| 右 | `direction=3` |
+
+### 智能追踪
+
+```python
+# 将目标框 (bbox) 移到画面中央
+center_target(bbox, frame_size)
+    ↓
+计算中心偏移
+    ↓
+转换为云台步数
+    ↓
+调用 move() API
+```
+
+---
+
+## 命令行接口
+
+```bash
+# 列出摄像头
+python main.py --list
+
+# 自动检测
+python main.py
+python main.py --camera auto
+
+# 指定源
+python main.py --camera usb
+python main.py --camera mooer
+python main.py --camera rtsp --rtsp-url URL
+
+# 纯鼠标
+python main.py --camera mouse
+```
+
+---
+
+## 开发笔记
+
+### 常见问题
+
+1. **MediaPipe 版本兼容性**: 新版 API (`mp.tasks`) 与传统 API (`mp.solutions`) 差异大，本项目使用传统 API 更稳定。
+
+2. **RTSP 延迟**: 使用 `CAP_FFMPEG` 后端 + `set(CAP_PROP_BUFFERSIZE, 1)` 降低延迟。
+
+3. **摄像头权限**: Linux 需要用户加入 `video` 组。
+
+4. **手势抖动**: 添加移动平均滤波或提高检测阈值。
+
+### 优化方向
+
+- [ ] 添加音效（拉弓、放箭、命中）
+- [ ] 多人对战模式
+- [ ] 风力影响
+- [ ] 移动靶
+- [ ] 箭的旋转动画
+
+---
+
+## 依赖安装
+
+```bash
+# 使用 uv（推荐）
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# 或使用 pip
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## 运行环境
+
+- **OS**: Ubuntu 24.04 / Linux 6.17
+- **GPU**: 可选（MediaPipe 默认 CPU）
+- **摄像头**: USB 免驱 或 RTSP 网络流
+- **输入**: 鼠标（必需），摄像头（可选）
+
+---
+
+## 参考资料
+
+- [MediaPipe Hands](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker)
+- [Pygame Documentation](https://www.pygame.org/docs/)
+- [OpenCV VideoCapture](https://docs.opencv.org/4.x/d8/dfe/classcv_1_1VideoCapture.html)
+- [萤石云 OpenAPI](https://open.ys7.com/doc/zh/book/index/abstract.html)
