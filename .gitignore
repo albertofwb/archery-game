@@ -44,3 +44,8 @@ Thumbs.db
 # Game recordings/sessions
 *.mp4
 *.avi
+
+# Environment variables (sensitive)
+.env
+.env.local
+.env.*.local
